@@ -13,7 +13,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS для Browser Extension
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === MODELS ===
+# Models
 class VideoMetadata(BaseModel):
     id: str
     filename: str
@@ -68,7 +67,7 @@ class UserProgress(BaseModel):
     current_segment: int
     locked: bool
 
-# === STORAGE (в продакшене - БД) ===
+# Storage
 videos_db = {}
 segments_db = {}
 quizzes_db = {}
@@ -77,7 +76,7 @@ progress_db = {}
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# === ENDPOINTS ===
+# Endpoints
 
 @app.get("/")
 def root():
@@ -233,7 +232,7 @@ def complete_segment(video_id: str, user_id: str, segment_index: int):
     
     return {"message": "Segment completed", "progress": progress}
 
-# === DEBUG ENDPOINTS ===
+# Debug
 
 @app.post("/debug/create_test_data")
 def create_test_data():
