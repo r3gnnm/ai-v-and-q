@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  # FastAPI Backend
+  backend:
+    build: .
+    container_name: video-quiz-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+      - ./uploads:/app/uploads
+      - ./processing:/app/processing
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/videoquiz
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_ENDPOINT=http://ollama:11434/api/generate
+    depends_on:
+      - db
+      - redis
+      - ollama
+    networks:
+      - quiz-network
+    restart: unless-stopped
+
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: video-quiz-db
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=videoquiz
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - quiz-network
+    restart: unless-stopped
+
+  # Redis (для кэша и Celery)
+  redis:
+    image: redis:7-alpine
+    container_name: video-quiz-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - quiz-network
+    restart: unless-stopped
+
+  # Ollama (локальная LLM)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: video-quiz-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - quiz-network
+    restart: unless-stopped
+    # После запуска нужно выполнить: docker exec -it video-quiz-ollama ollama pull llama3
+
+  # Celery Worker (опционально, для фоновой обработки)
+  celery_worker:
+    build: .
+    container_name: video-quiz-celery
+    command: celery -A app.celery_app worker --loglevel=info
+    volumes:
+      - ./:/app
+      - ./uploads:/app/uploads
+      - ./processing:/app/processing
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/videoquiz
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_ENDPOINT=http://ollama:11434/api/generate
+    depends_on:
+      - redis
+      - db
+    networks:
+      - quiz-network
+    restart: unless-stopped
+
+networks:
+  quiz-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
