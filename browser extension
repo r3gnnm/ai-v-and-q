@@ -1,0 +1,475 @@
+// Content Script для внедрения квизов в видеоплеер
+// Работает с HTML5 video и YouTube
+
+const API_BASE_URL = 'http://localhost:8000';
+
+class VideoQuizOverlay {
+    constructor() {
+        this.videoElement = null;
+        this.overlayContainer = null;
+        this.currentVideoId = null;
+        this.segments = [];
+        this.quizzes = {};
+        this.userProgress = {
+            completed_segments: [],
+            current_segment: 0,
+            locked: false
+        };
+        this.currentSegmentIndex = 0;
+        this.quizActive = false;
+        
+        this.init();
+    }
+    
+    async init() {
+        // Найти видеоэлемент
+        this.findVideoElement();
+        
+        if (!this.videoElement) {
+            console.log('Video element not found, retrying...');
+            setTimeout(() => this.init(), 1000);
+            return;
+        }
+        
+        console.log('Video Quiz Extension: Video element found');
+        
+        // Создать overlay контейнер
+        this.createOverlayContainer();
+        
+        // Слушатели событий видео
+        this.attachVideoListeners();
+        
+        // Получить данные с backend (если доступен)
+        await this.loadVideoData();
+    }
+    
+    findVideoElement() {
+        // Поиск HTML5 video элемента
+        this.videoElement = document.querySelector('video');
+        
+        // Для YouTube
+        if (window.location.hostname.includes('youtube.com')) {
+            this.videoElement = document.querySelector('.html5-main-video');
+        }
+    }
+    
+    createOverlayContainer() {
+        // Создать контейнер для overlay
+        this.overlayContainer = document.createElement('div');
+        this.overlayContainer.id = 'video-quiz-overlay';
+        this.overlayContainer.className = 'quiz-overlay-hidden';
+        
+        // Вставить рядом с видео
+        const videoContainer = this.videoElement.parentElement;
+        videoContainer.style.position = 'relative';
+        videoContainer.appendChild(this.overlayContainer);
+        
+        console.log('Quiz overlay container created');
+    }
+    
+    attachVideoListeners() {
+        // Отслеживание времени воспроизведения
+        this.videoElement.addEventListener('timeupdate', () => {
+            this.onTimeUpdate();
+        });
+        
+        // Попытка перемотки - блокируем если тест не пройден
+        this.videoElement.addEventListener('seeking', (e) => {
+            this.onSeeking(e);
+        });
+        
+        // Пауза/плей
+        this.videoElement.addEventListener('pause', () => {
+            console.log('Video paused');
+        });
+    }
+    
+    async loadVideoData() {
+        // Определить ID видео
+        const videoId = this.extractVideoId();
+        
+        if (!videoId) {
+            console.log('Could not extract video ID');
+            return;
+        }
+        
+        this.currentVideoId = videoId;
+        
+        try {
+            // Загрузить сегменты
+            const segmentsResponse = await fetch(`${API_BASE_URL}/video/${videoId}/segments`);
+            if (segmentsResponse.ok) {
+                this.segments = await segmentsResponse.json();
+                console.log(`Loaded ${this.segments.length} segments`);
+                
+                // Загрузить квизы для каждого сегмента
+                for (const segment of this.segments) {
+                    const quizResponse = await fetch(`${API_BASE_URL}/segment/${segment.id}/quiz`);
+                    if (quizResponse.ok) {
+                        const quiz = await quizResponse.json();
+                        this.quizzes[segment.id] = quiz;
+                    }
+                }
+                
+                // Загрузить прогресс пользователя
+                const userId = this.getUserId();
+                const progressResponse = await fetch(`${API_BASE_URL}/video/${videoId}/progress/${userId}`);
+                if (progressResponse.ok) {
+                    this.userProgress = await progressResponse.json();
+                }
+                
+                console.log('Video data loaded successfully');
+            }
+        } catch (error) {
+            console.error('Failed to load video data:', error);
+            // Использовать тестовые данные для демо
+            this.loadMockData();
+        }
+    }
+    
+    extractVideoId() {
+        // Для YouTube
+        if (window.location.hostname.includes('youtube.com')) {
+            const urlParams = new URLSearchParams(window.location.search);
+            return urlParams.get('v');
+        }
+        
+        // Для других платформ - использовать URL или data-атрибут
+        return this.videoElement.getAttribute('data-video-id') || 'local-video';
+    }
+    
+    getUserId() {
+        // Получить или создать user ID
+        let userId = localStorage.getItem('video_quiz_user_id');
+        if (!userId) {
+            userId = 'user-' + Math.random().toString(36).substr(2, 9);
+            localStorage.setItem('video_quiz_user_id', userId);
+        }
+        return userId;
+    }
+    
+    onTimeUpdate() {
+        if (this.quizActive) return; // Не проверять во время теста
+        
+        const currentTime = this.videoElement.currentTime;
+        
+        // Проверить, достигли ли конца текущего сегмента
+        const currentSegment = this.segments[this.currentSegmentIndex];
+        if (!currentSegment) return;
+        
+        const segmentEndTime = this.parseTimestamp(currentSegment.end_time);
+        
+        // Если достигли конца сегмента и он ещё не пройден
+        if (currentTime >= segmentEndTime - 0.5 && 
+            !this.userProgress.completed_segments.includes(this.currentSegmentIndex)) {
+            
+            this.pauseVideoAndShowQuiz(this.currentSegmentIndex);
+        }
+    }
+    
+    onSeeking(event) {
+        // Блокировка перемотки вперед, если сегменты не пройдены
+        const seekTime = this.videoElement.currentTime;
+        
+        // Найти максимальное разрешённое время
+        let maxAllowedTime = 0;
+        for (let i = 0; i < this.segments.length; i++) {
+            if (this.userProgress.completed_segments.includes(i)) {
+                maxAllowedTime = this.parseTimestamp(this.segments[i].end_time);
+            } else {
+                break;
+            }
+        }
+        
+        // Если попытка перемотать дальше разрешённого
+        if (seekTime > maxAllowedTime + 1) {
+            event.preventDefault();
+            this.videoElement.currentTime = maxAllowedTime;
+            this.showMessage('❌ Complete the current quiz to unlock this section');
+        }
+    }
+    
+    pauseVideoAndShowQuiz(segmentIndex) {
+        this.videoElement.pause();
+        this.quizActive = true;
+        
+        const segment = this.segments[segmentIndex];
+        const quiz = this.quizzes[segment.id];
+        
+        if (!quiz) {
+            console.error('Quiz not found for segment:', segment.id);
+            return;
+        }
+        
+        this.renderQuiz(quiz, segmentIndex);
+    }
+    
+    renderQuiz(quiz, segmentIndex) {
+        const segment = this.segments[segmentIndex];
+        
+        let html = `
+            <div class="quiz-modal">
+                <div class="quiz-header">
+                    <h2>📚 Quiz: ${segment.topic_title}</h2>
+                    <p class="quiz-summary">${segment.short_summary}</p>
+                </div>
+                <div class="quiz-body" id="quiz-questions">
+        `;
+        
+        quiz.questions.forEach((question, index) => {
+            html += this.renderQuestion(question, index);
+        });
+        
+        html += `
+                </div>
+                <div class="quiz-footer">
+                    <button id="submit-quiz-btn" class="btn-primary">Submit Answers</button>
+                    <div id="quiz-result" class="quiz-result-hidden"></div>
+                </div>
+            </div>
+        `;
+        
+        this.overlayContainer.innerHTML = html;
+        this.overlayContainer.className = 'quiz-overlay-visible';
+        
+        // Прикрепить обработчики
+        document.getElementById('submit-quiz-btn').addEventListener('click', () => {
+            this.submitQuiz(quiz, segmentIndex);
+        });
+    }
+    
+    renderQuestion(question, index) {
+        let html = `
+            <div class="quiz-question" data-question-id="${question.id}">
+                <h3>Question ${index + 1}</h3>
+                <p class="question-text">${question.question}</p>
+        `;
+        
+        if (question.type === 'multiple_choice') {
+            html += '<div class="options">';
+            question.options.forEach((option, i) => {
+                html += `
+                    <label class="option">
+                        <input type="radio" name="q${index}" value="${option}">
+                        <span>${option}</span>
+                    </label>
+                `;
+            });
+            html += '</div>';
+        } else if (question.type === 'true_false') {
+            html += `
+                <div class="options">
+                    <label class="option">
+                        <input type="radio" name="q${index}" value="True">
+                        <span>True</span>
+                    </label>
+                    <label class="option">
+                        <input type="radio" name="q${index}" value="False">
+                        <span>False</span>
+                    </label>
+                </div>
+            `;
+        } else if (question.type === 'short_answer') {
+            html += `
+                <input type="text" class="short-answer-input" name="q${index}" placeholder="Type your answer...">
+            `;
+        }
+        
+        html += '</div>';
+        return html;
+    }
+    
+    async submitQuiz(quiz, segmentIndex) {
+        const answers = this.collectAnswers(quiz);
+        
+        // Проверить все ответы
+        let allCorrect = true;
+        let results = [];
+        
+        for (let i = 0; i < quiz.questions.length; i++) {
+            const question = quiz.questions[i];
+            const userAnswer = answers[i];
+            
+            // Отправить на проверку в backend
+            try {
+                const response = await fetch(
+                    `${API_BASE_URL}/segment/${this.segments[segmentIndex].id}/answer`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            question_id: question.id,
+                            user_answer: userAnswer
+                        })
+                    }
+                );
+                
+                const result = await response.json();
+                results.push(result);
+                
+                if (!result.correct) {
+                    allCorrect = false;
+                }
+            } catch (error) {
+                // Fallback: локальная проверка
+                const correct = userAnswer.toLowerCase().trim() === 
+                               question.correct_answer.toLowerCase().trim();
+                results.push({ correct });
+                if (!correct) allCorrect = false;
+            }
+        }
+        
+        if (allCorrect) {
+            this.onQuizPassed(segmentIndex);
+        } else {
+            this.onQuizFailed(segmentIndex, results);
+        }
+    }
+    
+    collectAnswers(quiz) {
+        const answers = [];
+        
+        quiz.questions.forEach((question, index) => {
+            const questionEl = document.querySelector(`[data-question-id="${question.id}"]`);
+            
+            if (question.type === 'short_answer') {
+                const input = questionEl.querySelector('input[type="text"]');
+                answers.push(input.value.trim());
+            } else {
+                const selected = questionEl.querySelector('input[type="radio"]:checked');
+                answers.push(selected ? selected.value : '');
+            }
+        });
+        
+        return answers;
+    }
+    
+    async onQuizPassed(segmentIndex) {
+        // Отметить сегмент как пройденный
+        this.userProgress.completed_segments.push(segmentIndex);
+        this.currentSegmentIndex = segmentIndex + 1;
+        
+        // Обновить на backend
+        try {
+            await fetch(
+                `${API_BASE_URL}/video/${this.currentVideoId}/progress/${this.getUserId()}/complete`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ segment_index: segmentIndex })
+                }
+            );
+        } catch (error) {
+            console.error('Failed to update progress:', error);
+        }
+        
+        // Показать успех
+        this.showSuccessMessage();
+        
+        // Продолжить воспроизведение
+        setTimeout(() => {
+            this.hideQuiz();
+            this.videoElement.play();
+        }, 2000);
+    }
+    
+    onQuizFailed(segmentIndex, results) {
+        const segment = this.segments[segmentIndex];
+        const startTime = this.parseTimestamp(segment.start_time);
+        
+        // Показать ошибку
+        this.showFailureMessage();
+        
+        // Перемотать к началу сегмента
+        setTimeout(() => {
+            this.hideQuiz();
+            this.videoElement.currentTime = startTime;
+            this.videoElement.play();
+        }, 3000);
+    }
+    
+    showSuccessMessage() {
+        const resultDiv = document.getElementById('quiz-result');
+        resultDiv.innerHTML = `
+            <div class="result-success">
+                <h3>✅ Excellent!</h3>
+                <p>All answers correct. Continuing to next segment...</p>
+            </div>
+        `;
+        resultDiv.className = 'quiz-result-visible';
+    }
+    
+    showFailureMessage() {
+        const resultDiv = document.getElementById('quiz-result');
+        resultDiv.innerHTML = `
+            <div class="result-failure">
+                <h3>❌ Not quite right</h3>
+                <p>Please rewatch this segment and try again.</p>
+            </div>
+        `;
+        resultDiv.className = 'quiz-result-visible';
+    }
+    
+    hideQuiz() {
+        this.overlayContainer.className = 'quiz-overlay-hidden';
+        this.quizActive = false;
+    }
+    
+    showMessage(text) {
+        // Временное сообщение
+        const msg = document.createElement('div');
+        msg.className = 'quiz-toast';
+        msg.textContent = text;
+        document.body.appendChild(msg);
+        
+        setTimeout(() => {
+            msg.remove();
+        }, 3000);
+    }
+    
+    parseTimestamp(timeStr) {
+        const parts = timeStr.split(':');
+        if (parts.length === 3) {
+            return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
+        }
+        return 0;
+    }
+    
+    loadMockData() {
+        // Mock данные для демонстрации
+        this.segments = [
+            {
+                id: 'seg-001',
+                start_time: '00:00:00',
+                end_time: '00:00:30',
+                topic_title: 'Introduction',
+                short_summary: 'Welcome and overview'
+            }
+        ];
+        
+        this.quizzes = {
+            'seg-001': {
+                id: 'quiz-001',
+                segment_id: 'seg-001',
+                questions: [
+                    {
+                        id: 'q1',
+                        type: 'multiple_choice',
+                        question: 'What is this video about?',
+                        options: ['Topic A', 'Topic B', 'Topic C', 'Topic D'],
+                        correct_answer: 'Topic A'
+                    }
+                ]
+            }
+        };
+    }
+}
+
+// Инициализация при загрузке страницы
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+        new VideoQuizOverlay();
+    });
+} else {
+    new VideoQuizOverlay();
+}
