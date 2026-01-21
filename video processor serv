@@ -1,0 +1,221 @@
+import cv2
+import subprocess
+from pathlib import Path
+from typing import List, Tuple
+import numpy as np
+from datetime import timedelta
+
+class VideoProcessor:
+    """
+    Обработка видео: извлечение фреймов и аудио
+    """
+    
+    def __init__(self, video_path: str):
+        self.video_path = Path(video_path)
+        self.cap = cv2.VideoCapture(str(video_path))
+        
+        if not self.cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+        
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.duration = self.frame_count / self.fps if self.fps > 0 else 0
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    def get_metadata(self) -> dict:
+        """Получить метаданные видео"""
+        return {
+            "duration": self.duration,
+            "fps": self.fps,
+            "frame_count": self.frame_count,
+            "resolution": f"{self.width}x{self.height}"
+        }
+    
+    def extract_audio(self, output_path: str) -> str:
+        """
+        Извлечь аудиодорожку из видео
+        
+        Args:
+            output_path: путь для сохранения аудио (.wav)
+        
+        Returns:
+            путь к аудиофайлу
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Используем ffmpeg для извлечения аудио
+        command = [
+            'ffmpeg',
+            '-i', str(self.video_path),
+            '-vn',  # без видео
+            '-acodec', 'pcm_s16le',  # WAV формат
+            '-ar', '16000',  # sample rate 16kHz (оптимально для Whisper)
+            '-ac', '1',  # моно
+            '-y',  # перезаписать если существует
+            str(output_path)
+        ]
+        
+        try:
+            subprocess.run(command, check=True, capture_output=True)
+            return str(output_path)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Audio extraction failed: {e.stderr.decode()}")
+    
+    def extract_frames(self, 
+                      interval_seconds: float = 1.0,
+                      output_dir: str = None) -> List[Tuple[float, np.ndarray]]:
+        """
+        Извлечь фреймы из видео с заданным интервалом
+        
+        Args:
+            interval_seconds: интервал между фреймами в секундах
+            output_dir: директория для сохранения (опционально)
+        
+        Returns:
+            список кортежей (timestamp, frame)
+        """
+        frames = []
+        interval_frames = int(self.fps * interval_seconds)
+        
+        if output_dir:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+        
+        frame_idx = 0
+        saved_count = 0
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            
+            if frame_idx % interval_frames == 0:
+                timestamp = frame_idx / self.fps
+                frames.append((timestamp, frame))
+                
+                if output_dir:
+                    frame_path = output_dir / f"frame_{saved_count:06d}_{timestamp:.2f}s.jpg"
+                    cv2.imwrite(str(frame_path), frame)
+                    saved_count += 1
+            
+            frame_idx += 1
+        
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # reset
+        return frames
+    
+    def detect_scene_changes(self, threshold: float = 30.0) -> List[float]:
+        """
+        Детекция смены сцен на основе разницы между фреймами
+        
+        Args:
+            threshold: порог для определения смены сцены
+        
+        Returns:
+            список временных меток смены сцен
+        """
+        scene_changes = [0.0]  # начало всегда сцена
+        prev_frame = None
+        frame_idx = 0
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            
+            # Конвертация в grayscale для сравнения
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            if prev_frame is not None:
+                # Вычисление разницы между фреймами
+                diff = cv2.absdiff(prev_frame, gray)
+                mean_diff = np.mean(diff)
+                
+                if mean_diff > threshold:
+                    timestamp = frame_idx / self.fps
+                    scene_changes.append(timestamp)
+            
+            prev_frame = gray
+            frame_idx += 1
+        
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # reset
+        return scene_changes
+    
+    def extract_frame_at_time(self, timestamp: float) -> np.ndarray:
+        """
+        Извлечь один фрейм на заданной временной метке
+        
+        Args:
+            timestamp: время в секундах
+        
+        Returns:
+            numpy array с изображением
+        """
+        frame_number = int(timestamp * self.fps)
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ret, frame = self.cap.read()
+        
+        if not ret:
+            raise ValueError(f"Cannot read frame at {timestamp}s")
+        
+        return frame
+    
+    @staticmethod
+    def format_timestamp(seconds: float) -> str:
+        """Конвертировать секунды в HH:MM:SS формат"""
+        td = timedelta(seconds=seconds)
+        hours, remainder = divmod(td.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    
+    @staticmethod
+    def parse_timestamp(timestamp: str) -> float:
+        """Конвертировать HH:MM:SS в секунды"""
+        parts = timestamp.split(':')
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        else:
+            return float(parts[0])
+    
+    def close(self):
+        """Освободить ресурсы"""
+        if self.cap:
+            self.cap.release()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+# === ПРИМЕР ИСПОЛЬЗОВАНИЯ ===
+if __name__ == "__main__":
+    # Пример обработки видео
+    video_path = "test_video.mp4"
+    
+    with VideoProcessor(video_path) as processor:
+        # Метаданные
+        meta = processor.get_metadata()
+        print(f"Duration: {meta['duration']:.2f}s")
+        print(f"FPS: {meta['fps']}")
+        print(f"Resolution: {meta['resolution']}")
+        
+        # Извлечение аудио
+        audio_path = processor.extract_audio("output/audio.wav")
+        print(f"Audio saved to: {audio_path}")
+        
+        # Извлечение ключевых фреймов
+        frames = processor.extract_frames(interval_seconds=2.0, output_dir="output/frames")
+        print(f"Extracted {len(frames)} frames")
+        
+        # Детекция смены сцен
+        scenes = processor.detect_scene_changes(threshold=25.0)
+        print(f"Detected {len(scenes)} scene changes:")
+        for ts in scenes[:5]:  # первые 5
+            print(f"  - {processor.format_timestamp(ts)}")
