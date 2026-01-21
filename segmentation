@@ -1,0 +1,310 @@
+import json
+import re
+from typing import List, Dict, Optional
+from datetime import timedelta
+import requests
+
+class SegmentationService:
+    """
+    Сегментация транскрипта на тематические блоки с использованием LLM
+    """
+    
+    def __init__(self, 
+                 llm_endpoint: str = "http://localhost:11434/api/generate",
+                 model: str = "llama3"):
+        """
+        Args:
+            llm_endpoint: URL для Ollama API
+            model: название модели (llama3, mistral, etc.)
+        """
+        self.llm_endpoint = llm_endpoint
+        self.model = model
+    
+    def segment_transcript(self,
+                          transcript: Dict,
+                          min_segment_duration: float = 60.0,
+                          max_segment_duration: float = 300.0) -> List[Dict]:
+        """
+        Разделить транскрипт на тематические сегменты
+        
+        Args:
+            transcript: результат ASR с timestamps
+            min_segment_duration: минимальная длина сегмента (сек)
+            max_segment_duration: максимальная длина сегмента (сек)
+        
+        Returns:
+            список сегментов с метаданными
+        """
+        segments = transcript["segments"]
+        full_text = transcript["full_text"]
+        
+        # Шаг 1: Группировка ASR-сегментов в текстовые блоки
+        text_blocks = self._create_text_blocks(segments, min_segment_duration)
+        
+        # Шаг 2: LLM-анализ для определения тематических границ
+        topic_segments = self._identify_topics_with_llm(text_blocks, full_text)
+        
+        # Шаг 3: Генерация метаданных для каждого сегмента
+        enriched_segments = []
+        for i, seg in enumerate(topic_segments):
+            enriched = self._enrich_segment(seg, i)
+            enriched_segments.append(enriched)
+        
+        return enriched_segments
+    
+    def _create_text_blocks(self, 
+                           asr_segments: List[Dict],
+                           min_duration: float) -> List[Dict]:
+        """
+        Группировать мелкие ASR-сегменты в более крупные блоки
+        """
+        blocks = []
+        current_block = {
+            "start": asr_segments[0]["start"],
+            "end": asr_segments[0]["end"],
+            "text": asr_segments[0]["text"]
+        }
+        
+        for seg in asr_segments[1:]:
+            duration = current_block["end"] - current_block["start"]
+            
+            if duration < min_duration:
+                # Добавить к текущему блоку
+                current_block["end"] = seg["end"]
+                current_block["text"] += " " + seg["text"]
+            else:
+                # Сохранить текущий блок и начать новый
+                blocks.append(current_block)
+                current_block = {
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": seg["text"]
+                }
+        
+        blocks.append(current_block)
+        return blocks
+    
+    def _identify_topics_with_llm(self,
+                                  text_blocks: List[Dict],
+                                  full_text: str) -> List[Dict]:
+        """
+        Использовать LLM для определения тематических сегментов
+        """
+        # Создание промпта для LLM
+        prompt = self._create_segmentation_prompt(text_blocks, full_text)
+        
+        # Запрос к LLM
+        try:
+            response = self._call_llm(prompt)
+            topic_segments = self._parse_llm_response(response, text_blocks)
+        except Exception as e:
+            print(f"LLM call failed: {e}")
+            # Fallback: использовать исходные блоки
+            topic_segments = text_blocks
+        
+        return topic_segments
+    
+    def _create_segmentation_prompt(self, 
+                                   blocks: List[Dict],
+                                   full_text: str) -> str:
+        """
+        Создать промпт для LLM
+        """
+        blocks_text = "\n\n".join([
+            f"[{self._format_time(b['start'])} - {self._format_time(b['end'])}]\n{b['text']}"
+            for b in blocks
+        ])
+        
+        prompt = f"""You are analyzing a video transcript to identify distinct thematic segments.
+
+FULL TRANSCRIPT:
+{full_text[:2000]}... (truncated)
+
+TIMESTAMPED BLOCKS:
+{blocks_text}
+
+TASK:
+1. Identify where the topic changes significantly
+2. Group related blocks into thematic segments
+3. For each segment, provide:
+   - start_time (HH:MM:SS)
+   - end_time (HH:MM:SS)
+   - topic_title (concise, 5-10 words)
+   - brief_summary (1-2 sentences)
+
+OUTPUT FORMAT (JSON only, no markdown):
+[
+  {{
+    "start_time": "00:00:00",
+    "end_time": "00:03:45",
+    "topic_title": "Introduction to Machine Learning",
+    "brief_summary": "Overview of ML concepts and applications"
+  }},
+  ...
+]
+
+Respond ONLY with valid JSON array, no additional text."""
+        
+        return prompt
+    
+    def _call_llm(self, prompt: str) -> str:
+        """
+        Вызвать Ollama API
+        """
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.3,
+                "top_p": 0.9
+            }
+        }
+        
+        response = requests.post(self.llm_endpoint, json=payload, timeout=120)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result.get("response", "")
+    
+    def _parse_llm_response(self, 
+                           response: str,
+                           fallback_blocks: List[Dict]) -> List[Dict]:
+        """
+        Парсинг ответа LLM
+        """
+        try:
+            # Удалить markdown если есть
+            cleaned = re.sub(r'```json\s*|\s*```', '', response).strip()
+            segments = json.loads(cleaned)
+            
+            if not isinstance(segments, list) or len(segments) == 0:
+                return fallback_blocks
+            
+            # Конвертировать timestamps в секунды
+            for seg in segments:
+                if "start_time" in seg:
+                    seg["start"] = self._parse_time(seg["start_time"])
+                if "end_time" in seg:
+                    seg["end"] = self._parse_time(seg["end_time"])
+            
+            return segments
+        
+        except json.JSONDecodeError:
+            print("Failed to parse LLM response as JSON")
+            return fallback_blocks
+    
+    def _enrich_segment(self, segment: Dict, index: int) -> Dict:
+        """
+        Обогатить сегмент дополнительными метаданными
+        """
+        # Извлечь ключевые слова из summary
+        keywords = self._extract_keywords(
+            segment.get("brief_summary", "") + " " + segment.get("topic_title", "")
+        )
+        
+        enriched = {
+            "id": f"seg-{index:03d}",
+            "start_time": segment.get("start_time", self._format_time(segment.get("start", 0))),
+            "end_time": segment.get("end_time", self._format_time(segment.get("end", 0))),
+            "topic_title": segment.get("topic_title", f"Segment {index + 1}"),
+            "short_summary": segment.get("brief_summary", ""),
+            "keywords": keywords,
+            "text": segment.get("text", "")
+        }
+        
+        return enriched
+    
+    def _extract_keywords(self, text: str, max_keywords: int = 5) -> List[str]:
+        """
+        Извлечь ключевые слова из текста (простая эвристика)
+        """
+        # Удалить стоп-слова и выбрать длинные слова
+        stop_words = {'the', 'is', 'at', 'which', 'on', 'a', 'an', 'and', 'or', 'but', 'in', 'with', 'to', 'for', 'of'}
+        words = re.findall(r'\b[a-z]+\b', text.lower())
+        
+        keywords = [
+            w for w in words 
+            if w not in stop_words and len(w) > 4
+        ]
+        
+        # Подсчет частоты
+        word_freq = {}
+        for word in keywords:
+            word_freq[word] = word_freq.get(word, 0) + 1
+        
+        # Топ keywords по частоте
+        sorted_keywords = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+        return [kw[0] for kw in sorted_keywords[:max_keywords]]
+    
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        """Конвертировать секунды в HH:MM:SS"""
+        td = timedelta(seconds=seconds)
+        hours, remainder = divmod(td.seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    
+    @staticmethod
+    def _parse_time(time_str: str) -> float:
+        """Конвертировать HH:MM:SS в секунды"""
+        parts = time_str.split(':')
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        return 0.0
+    
+    def segment_with_scene_detection(self,
+                                    transcript: Dict,
+                                    scene_changes: List[float]) -> List[Dict]:
+        """
+        Комбинированная сегментация: текст + визуальные изменения
+        """
+        # Базовая текстовая сегментация
+        text_segments = self.segment_transcript(transcript)
+        
+        # Корректировка границ по визуальным изменениям
+        for seg in text_segments:
+            start = self._parse_time(seg["start_time"])
+            end = self._parse_time(seg["end_time"])
+            
+            # Найти ближайшую смену сцены к началу сегмента
+            closest_scene = min(
+                [sc for sc in scene_changes if abs(sc - start) < 10],
+                default=start,
+                key=lambda x: abs(x - start)
+            )
+            
+            if abs(closest_scene - start) < 5:  # в пределах 5 секунд
+                seg["start_time"] = self._format_time(closest_scene)
+        
+        return text_segments
+
+
+# === ПРИМЕР ИСПОЛЬЗОВАНИЯ ===
+if __name__ == "__main__":
+    # Mock transcript для тестирования
+    mock_transcript = {
+        "language": "en",
+        "duration": 300.0,
+        "full_text": "Welcome to this tutorial on machine learning. Today we'll cover basic concepts...",
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 15.5, "text": "Welcome to this tutorial on machine learning."},
+            {"id": 1, "start": 15.5, "end": 35.2, "text": "Today we'll cover basic concepts of supervised learning."},
+            {"id": 2, "start": 35.2, "end": 62.8, "text": "Let's start with linear regression, a fundamental algorithm."},
+            # ... больше сегментов
+        ]
+    }
+    
+    # Инициализация сервиса
+    segmenter = SegmentationService(model="llama3")
+    
+    # Сегментация
+    segments = segmenter.segment_transcript(mock_transcript)
+    
+    print(f"Created {len(segments)} topic segments:")
+    for seg in segments:
+        print(f"\n{seg['topic_title']}")
+        print(f"  Time: {seg['start_time']} - {seg['end_time']}")
+        print(f"  Summary: {seg['short_summary']}")
+        print(f"  Keywords: {', '.join(seg['keywords'])}")
