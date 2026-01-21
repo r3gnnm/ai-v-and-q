@@ -1,0 +1,331 @@
+import json
+import re
+import uuid
+from typing import List, Dict
+import requests
+
+class QuizGenerator:
+    """
+    Генерация тестовых заданий для видео-сегментов с использованием LLM
+    """
+    
+    def __init__(self,
+                 llm_endpoint: str = "http://localhost:11434/api/generate",
+                 model: str = "llama3"):
+        """
+        Args:
+            llm_endpoint: URL для Ollama API
+            model: название модели
+        """
+        self.llm_endpoint = llm_endpoint
+        self.model = model
+    
+    def generate_quiz(self,
+                     segment: Dict,
+                     num_questions: int = 4,
+                     question_types: List[str] = None) -> Dict:
+        """
+        Сгенерировать тест для сегмента
+        
+        Args:
+            segment: сегмент видео с текстом и метаданными
+            num_questions: количество вопросов (3-5)
+            question_types: типы вопросов ['multiple_choice', 'true_false', 'short_answer']
+        
+        Returns:
+            Quiz объект с вопросами
+        """
+        if question_types is None:
+            question_types = ['multiple_choice', 'true_false', 'short_answer']
+        
+        # Создание промпта для генерации теста
+        prompt = self._create_quiz_prompt(segment, num_questions, question_types)
+        
+        try:
+            # Запрос к LLM
+            response = self._call_llm(prompt)
+            
+            # Парсинг ответа
+            questions = self._parse_quiz_response(response)
+            
+            # Валидация и форматирование
+            if not questions or len(questions) < 3:
+                # Fallback: создать базовые вопросы
+                questions = self._generate_fallback_questions(segment)
+        
+        except Exception as e:
+            print(f"Quiz generation error: {e}")
+            questions = self._generate_fallback_questions(segment)
+        
+        # Создание Quiz объекта
+        quiz = {
+            "id": f"quiz-{uuid.uuid4().hex[:8]}",
+            "segment_id": segment.get("id", "unknown"),
+            "questions": questions[:num_questions]  # ограничить количество
+        }
+        
+        return quiz
+    
+    def _create_quiz_prompt(self,
+                           segment: Dict,
+                           num_questions: int,
+                           question_types: List[str]) -> str:
+        """
+        Создать промпт для генерации теста
+        """
+        text = segment.get("text", segment.get("short_summary", ""))
+        topic = segment.get("topic_title", "Unknown Topic")
+        summary = segment.get("short_summary", "")
+        
+        types_description = {
+            'multiple_choice': 'Multiple choice with 4 options (A, B, C, D)',
+            'true_false': 'True/False question',
+            'short_answer': 'Short answer (1-3 words expected)'
+        }
+        
+        types_str = "\n".join([f"- {types_description[t]}" for t in question_types])
+        
+        prompt = f"""You are creating a quiz to test understanding of educational video content.
+
+SEGMENT TOPIC: {topic}
+
+SEGMENT SUMMARY: {summary}
+
+FULL TRANSCRIPT:
+{text[:1500]}
+
+TASK:
+Generate {num_questions} high-quality educational questions that test comprehension of the key concepts from this segment.
+
+QUESTION TYPES TO USE:
+{types_str}
+
+REQUIREMENTS:
+1. Questions must be factual and answerable from the content
+2. Avoid ambiguous or trick questions
+3. Include a mix of question types
+4. For multiple choice: include 1 correct answer and 3 plausible distractors
+5. Ensure correct_answer is EXACTLY one of the options
+
+OUTPUT FORMAT (JSON only, no markdown):
+[
+  {{
+    "id": "q1",
+    "type": "multiple_choice",
+    "question": "What is the main topic discussed?",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correct_answer": "Option B"
+  }},
+  {{
+    "id": "q2",
+    "type": "true_false",
+    "question": "Python is a compiled language.",
+    "options": ["True", "False"],
+    "correct_answer": "False"
+  }},
+  {{
+    "id": "q3",
+    "type": "short_answer",
+    "question": "What keyword is used to define a function?",
+    "correct_answer": "def"
+  }}
+]
+
+Respond ONLY with valid JSON array."""
+        
+        return prompt
+    
+    def _call_llm(self, prompt: str) -> str:
+        """
+        Вызов Ollama API
+        """
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.7,  # немного креативности для разнообразия
+                "top_p": 0.9,
+                "num_predict": 1000
+            }
+        }
+        
+        response = requests.post(self.llm_endpoint, json=payload, timeout=120)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result.get("response", "")
+    
+    def _parse_quiz_response(self, response: str) -> List[Dict]:
+        """
+        Парсинг ответа LLM с вопросами
+        """
+        try:
+            # Очистка от markdown
+            cleaned = re.sub(r'```json\s*|\s*```', '', response).strip()
+            
+            # Попытка найти JSON массив
+            json_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+            if json_match:
+                cleaned = json_match.group(0)
+            
+            questions = json.loads(cleaned)
+            
+            if not isinstance(questions, list):
+                return []
+            
+            # Валидация и нормализация вопросов
+            validated = []
+            for i, q in enumerate(questions):
+                if self._validate_question(q):
+                    # Добавить ID если отсутствует
+                    if "id" not in q:
+                        q["id"] = f"q{i+1}"
+                    validated.append(q)
+            
+            return validated
+        
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing error: {e}")
+            return []
+    
+    def _validate_question(self, question: Dict) -> bool:
+        """
+        Проверить корректность вопроса
+        """
+        required_fields = ["type", "question", "correct_answer"]
+        
+        # Проверка обязательных полей
+        if not all(field in question for field in required_fields):
+            return False
+        
+        q_type = question["type"]
+        
+        # Валидация по типу
+        if q_type == "multiple_choice":
+            if "options" not in question or len(question["options"]) != 4:
+                return False
+            # Проверить, что correct_answer в options
+            if question["correct_answer"] not in question["options"]:
+                return False
+        
+        elif q_type == "true_false":
+            if "options" not in question:
+                question["options"] = ["True", "False"]
+            if question["correct_answer"] not in ["True", "False"]:
+                return False
+        
+        elif q_type == "short_answer":
+            # Короткий ответ должен быть не слишком длинным
+            if len(question["correct_answer"].split()) > 5:
+                return False
+        
+        else:
+            return False  # неизвестный тип
+        
+        return True
+    
+    def _generate_fallback_questions(self, segment: Dict) -> List[Dict]:
+        """
+        Создать простые fallback вопросы если LLM не справился
+        """
+        topic = segment.get("topic_title", "this topic")
+        
+        fallback = [
+            {
+                "id": "q1",
+                "type": "multiple_choice",
+                "question": f"What is the main topic of this segment?",
+                "options": [
+                    topic,
+                    "Unrelated topic A",
+                    "Unrelated topic B",
+                    "Unrelated topic C"
+                ],
+                "correct_answer": topic
+            },
+            {
+                "id": "q2",
+                "type": "true_false",
+                "question": f"This segment discusses {topic}.",
+                "options": ["True", "False"],
+                "correct_answer": "True"
+            },
+            {
+                "id": "q3",
+                "type": "short_answer",
+                "question": "What is one key concept mentioned?",
+                "correct_answer": segment.get("keywords", ["concept"])[0] if segment.get("keywords") else "concept"
+            }
+        ]
+        
+        return fallback
+    
+    def generate_quizzes_for_segments(self, 
+                                     segments: List[Dict],
+                                     questions_per_segment: int = 4) -> Dict[str, Dict]:
+        """
+        Сгенерировать тесты для всех сегментов
+        
+        Returns:
+            dict mapping segment_id -> quiz
+        """
+        quizzes = {}
+        
+        print(f"Generating quizzes for {len(segments)} segments...")
+        
+        for i, segment in enumerate(segments, 1):
+            print(f"  [{i}/{len(segments)}] Processing: {segment.get('topic_title', 'Untitled')}")
+            
+            quiz = self.generate_quiz(
+                segment,
+                num_questions=questions_per_segment
+            )
+            
+            quizzes[segment["id"]] = quiz
+        
+        print("Quiz generation complete!")
+        return quizzes
+    
+    def save_quizzes(self, quizzes: Dict[str, Dict], output_path: str):
+        """
+        Сохранить сгенерированные тесты в JSON
+        """
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(quizzes, f, ensure_ascii=False, indent=2)
+        
+        print(f"Quizzes saved to: {output_path}")
+
+
+# === ПРИМЕР ИСПОЛЬЗОВАНИЯ ===
+if __name__ == "__main__":
+    # Mock сегмент
+    test_segment = {
+        "id": "seg-001",
+        "start_time": "00:00:00",
+        "end_time": "00:03:45",
+        "topic_title": "Introduction to Machine Learning",
+        "short_summary": "Overview of machine learning concepts, supervised vs unsupervised learning, and basic applications.",
+        "keywords": ["machine learning", "supervised", "unsupervised", "algorithms"],
+        "text": """Machine learning is a subset of artificial intelligence that focuses on building systems 
+        that can learn from data. There are two main types: supervised learning, where the model learns 
+        from labeled data, and unsupervised learning, where it finds patterns in unlabeled data. 
+        Common applications include image recognition, natural language processing, and recommendation systems."""
+    }
+    
+    # Инициализация генератора
+    generator = QuizGenerator(model="llama3")
+    
+    # Генерация теста
+    quiz = generator.generate_quiz(test_segment, num_questions=4)
+    
+    print(f"\nGenerated Quiz for: {test_segment['topic_title']}")
+    print(f"Quiz ID: {quiz['id']}")
+    print(f"\nQuestions:")
+    
+    for q in quiz['questions']:
+        print(f"\n{q['id']}. [{q['type']}] {q['question']}")
+        if 'options' in q:
+            for opt in q['options']:
+                print(f"   - {opt}")
+        print(f"   ✓ Answer: {q['correct_answer']}")
