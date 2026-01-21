@@ -1,0 +1,329 @@
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+import uuid
+
+# Импорт 
+# from services.video_processor import VideoProcessor
+# from services.asr_service import ASRService
+# from services.segmentation_service import SegmentationService
+# from services.quiz_generator import QuizGenerator
+
+class VideoPipeline:
+    """
+    Полный pipeline обработки видео:
+    Video → Frames → Audio → Text → Segments → Quizzes
+    """
+    
+    def __init__(self,
+                 work_dir: str = "processing",
+                 whisper_model: str = "base",
+                 llm_model: str = "llama3",
+                 llm_endpoint: str = "http://localhost:11434/api/generate"):
+        """
+        Args:
+            work_dir: рабочая директория для временных файлов
+            whisper_model: модель Whisper (tiny, base, small, medium, large)
+            llm_model: модель LLM для сегментации и генерации тестов
+            llm_endpoint: endpoint для Ollama
+        """
+        self.work_dir = Path(work_dir)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Инициализация сервисов
+        print("Initializing services...")
+        
+        # В реальности здесь будут настоящие импорты
+        # self.asr = ASRService(model_size=whisper_model)
+        # self.segmenter = SegmentationService(llm_endpoint=llm_endpoint, model=llm_model)
+        # self.quiz_gen = QuizGenerator(llm_endpoint=llm_endpoint, model=llm_model)
+        
+        print("Pipeline ready!")
+    
+    def process_video(self,
+                     video_path: str,
+                     video_id: Optional[str] = None,
+                     extract_frames: bool = True,
+                     questions_per_segment: int = 4) -> Dict:
+        """
+        Полная обработка видео
+        
+        Args:
+            video_path: путь к видеофайлу
+            video_id: ID видео (автогенерация если None)
+            extract_frames: извлекать ли ключевые фреймы
+            questions_per_segment: количество вопросов на сегмент
+        
+        Returns:
+            dict с полными результатами обработки
+        """
+        if video_id is None:
+            video_id = str(uuid.uuid4())
+        
+        print(f"\n{'='*60}")
+        print(f"Processing Video: {video_path}")
+        print(f"Video ID: {video_id}")
+        print(f"{'='*60}\n")
+        
+        # Создание директории для этого видео
+        video_dir = self.work_dir / video_id
+        video_dir.mkdir(exist_ok=True)
+        
+        results = {
+            "video_id": video_id,
+            "video_path": str(video_path),
+            "status": "processing",
+            "metadata": {},
+            "segments": [],
+            "quizzes": {}
+        }
+        
+        try:
+            # ===== ШАГ 1: Извлечение аудио и фреймов =====
+            print("Step 1: Video Processing")
+            metadata, audio_path, frames_info = self._step1_video_processing(
+                video_path, 
+                video_dir,
+                extract_frames
+            )
+            results["metadata"] = metadata
+            
+            # ===== ШАГ 2: Распознавание речи (ASR) =====
+            print("\nStep 2: Speech Recognition (ASR)")
+            transcript = self._step2_asr(audio_path, video_dir)
+            
+            # ===== ШАГ 3: Сегментация по темам =====
+            print("\nStep 3: Topic Segmentation")
+            segments = self._step3_segmentation(
+                transcript,
+                frames_info.get("scene_changes", []) if frames_info else []
+            )
+            results["segments"] = segments
+            
+            # ===== ШАГ 4: Генерация тестов =====
+            print("\nStep 4: Quiz Generation")
+            quizzes = self._step4_quiz_generation(segments, questions_per_segment)
+            results["quizzes"] = quizzes
+            
+            # Связать квизы с сегментами
+            for segment in results["segments"]:
+                segment["quiz_id"] = quizzes.get(segment["id"], {}).get("id")
+            
+            results["status"] = "completed"
+            
+            # Сохранение результатов
+            self._save_results(results, video_dir)
+            
+            print("\n" + "="*60)
+            print("✓ Processing Complete!")
+            print(f"  - Segments created: {len(segments)}")
+            print(f"  - Quizzes generated: {len(quizzes)}")
+            print(f"  - Results saved to: {video_dir}")
+            print("="*60 + "\n")
+            
+        except Exception as e:
+            results["status"] = "error"
+            results["error"] = str(e)
+            print(f"\n✗ Error during processing: {e}")
+            raise
+        
+        return results
+    
+    def _step1_video_processing(self, 
+                                video_path: str,
+                                output_dir: Path,
+                                extract_frames: bool) -> tuple:
+        """
+        Шаг 1: Обработка видео (аудио + фреймы)
+        """
+        # В реальности используем VideoProcessor
+        # with VideoProcessor(video_path) as processor:
+        #     metadata = processor.get_metadata()
+        #     audio_path = processor.extract_audio(output_dir / "audio.wav")
+        #     
+        #     frames_info = None
+        #     if extract_frames:
+        #         frames = processor.extract_frames(interval_seconds=2.0)
+        #         scene_changes = processor.detect_scene_changes()
+        #         frames_info = {
+        #             "frames_count": len(frames),
+        #             "scene_changes": scene_changes
+        #         }
+        
+        # Mock данные для примера
+        metadata = {
+            "duration": 300.0,
+            "fps": 30.0,
+            "resolution": "1920x1080"
+        }
+        audio_path = str(output_dir / "audio.wav")
+        frames_info = {
+            "frames_count": 150,
+            "scene_changes": [0, 45, 120, 200, 280]
+        }
+        
+        print(f"  ✓ Audio extracted: {audio_path}")
+        if extract_frames:
+            print(f"  ✓ Frames extracted: {frames_info['frames_count']}")
+            print(f"  ✓ Scene changes detected: {len(frames_info['scene_changes'])}")
+        
+        return metadata, audio_path, frames_info
+    
+    def _step2_asr(self, audio_path: str, output_dir: Path) -> Dict:
+        """
+        Шаг 2: Распознавание речи
+        """
+        # В реальности используем ASRService
+        # transcript = self.asr.transcribe(audio_path, language="en")
+        # self.asr.save_transcript(transcript, output_dir / "transcript.json")
+        
+        # Mock данные
+        transcript = {
+            "language": "en",
+            "duration": 300.0,
+            "full_text": "This is a sample transcript...",
+            "segments": [
+                {
+                    "id": 0,
+                    "start": 0.0,
+                    "end": 15.0,
+                    "text": "Welcome to this tutorial on machine learning."
+                },
+                # ... больше сегментов
+            ]
+        }
+        
+        # Сохранение
+        with open(output_dir / "transcript.json", 'w') as f:
+            json.dump(transcript, f, indent=2)
+        
+        print(f"  ✓ Transcription complete")
+        print(f"  ✓ Language: {transcript['language']}")
+        print(f"  ✓ Duration: {transcript['duration']:.1f}s")
+        
+        return transcript
+    
+    def _step3_segmentation(self, 
+                           transcript: Dict,
+                           scene_changes: List[float]) -> List[Dict]:
+        """
+        Шаг 3: Сегментация на темы
+        """
+        # В реальности используем SegmentationService
+        # if scene_changes:
+        #     segments = self.segmenter.segment_with_scene_detection(transcript, scene_changes)
+        # else:
+        #     segments = self.segmenter.segment_transcript(transcript)
+        
+        # Mock данные
+        segments = [
+            {
+                "id": "seg-001",
+                "start_time": "00:00:00",
+                "end_time": "00:02:30",
+                "topic_title": "Introduction to Machine Learning",
+                "short_summary": "Overview of ML concepts and applications",
+                "keywords": ["machine learning", "AI", "algorithms"],
+                "text": "Full transcript text for this segment..."
+            },
+            {
+                "id": "seg-002",
+                "start_time": "00:02:30",
+                "end_time": "00:05:00",
+                "topic_title": "Supervised Learning",
+                "short_summary": "Explanation of supervised learning with examples",
+                "keywords": ["supervised", "labeled data", "classification"],
+                "text": "Full transcript text for this segment..."
+            }
+        ]
+        
+        print(f"  ✓ Created {len(segments)} topic segments")
+        for seg in segments:
+            print(f"    - {seg['topic_title']} ({seg['start_time']} - {seg['end_time']})")
+        
+        return segments
+    
+    def _step4_quiz_generation(self,
+                              segments: List[Dict],
+                              questions_per_segment: int) -> Dict[str, Dict]:
+        """
+        Шаг 4: Генерация тестов
+        """
+        # В реальности используем QuizGenerator
+        # quizzes = self.quiz_gen.generate_quizzes_for_segments(
+        #     segments,
+        #     questions_per_segment=questions_per_segment
+        # )
+        
+        # Mock данные
+        quizzes = {}
+        for segment in segments:
+            quiz = {
+                "id": f"quiz-{segment['id']}",
+                "segment_id": segment["id"],
+                "questions": [
+                    {
+                        "id": "q1",
+                        "type": "multiple_choice",
+                        "question": f"What is the main topic of '{segment['topic_title']}'?",
+                        "options": ["A", "B", "C", "D"],
+                        "correct_answer": "A"
+                    },
+                    {
+                        "id": "q2",
+                        "type": "true_false",
+                        "question": "Sample true/false question",
+                        "options": ["True", "False"],
+                        "correct_answer": "True"
+                    }
+                ]
+            }
+            quizzes[segment["id"]] = quiz
+        
+        print(f"  ✓ Generated quizzes for {len(quizzes)} segments")
+        
+        return quizzes
+    
+    def _save_results(self, results: Dict, output_dir: Path):
+        """
+        Сохранить все результаты
+        """
+        # Основной результат
+        with open(output_dir / "results.json", 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        # Отдельно сегменты для удобства
+        with open(output_dir / "segments.json", 'w', encoding='utf-8') as f:
+            json.dump(results["segments"], f, ensure_ascii=False, indent=2)
+        
+        # Отдельно квизы
+        with open(output_dir / "quizzes.json", 'w', encoding='utf-8') as f:
+            json.dump(results["quizzes"], f, ensure_ascii=False, indent=2)
+        
+        print(f"\n  Results saved to: {output_dir}")
+
+
+# === ПРИМЕР ИСПОЛЬЗОВАНИЯ ===
+if __name__ == "__main__":
+    # Инициализация pipeline
+    pipeline = VideoPipeline(
+        work_dir="processing",
+        whisper_model="base",
+        llm_model="llama3"
+    )
+    
+    # Обработка видео
+    video_path = "path/to/your/video.mp4"
+    
+    results = pipeline.process_video(
+        video_path=video_path,
+        video_id="test-video-001",
+        extract_frames=True,
+        questions_per_segment=4
+    )
+    
+    # Результаты доступны для использования в API
+    print(f"\nVideo ID: {results['video_id']}")
+    print(f"Status: {results['status']}")
+    print(f"Segments: {len(results['segments'])}")
+    print(f"Quizzes: {len(results['quizzes'])}")
